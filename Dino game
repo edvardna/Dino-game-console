@@ -1,0 +1,331 @@
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+
+#define BUTTON_PIN 3           // Button between D3 and GND (INPUT_PULLUP)
+#define BUZZER_PIN 8           // Passive buzzer D8 - 100-220R - + , - - GND
+
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+
+// ---------------- Game state ----------------
+bool gameOver = false;
+bool isJumping = false;
+
+int dinoX = 14;
+int dinoY = 44;                // top-left of dino body
+int velocity = 0;
+const int gravity = 2;
+const int groundY = 44;
+
+int cactusX1 = 128;
+int cactusX2 = 190;
+int cactusH1 = 16;
+int cactusH2 = 20;
+int cactusType1 = 0;
+int cactusType2 = 1;
+
+int gameSpeed = 3;
+unsigned long lastSpeedIncrease = 0;
+unsigned long lastFrame = 0;
+unsigned long score = 0;
+
+// score when passing cactus
+bool passed1 = false;
+bool passed2 = false;
+
+// animation
+int runFrame = 0;              // 0/1
+unsigned long lastAnim = 0;
+
+// ground decoration
+int dot1 = 20, dot2 = 70, dot3 = 110;
+
+// ---------------- Sound chiptune background (original) ----------------
+unsigned long lastMusicTime = 0;
+int musicStep = 0;
+
+// iconic platformer-ish upbeat loop (original notes)
+const int musicNotes[] = {
+  659, 784, 988, 784,    // E5 G5 B5 G5
+  880, 784, 659, 784,    // A5 G5 E5 G5
+  740, 880, 988, 880,    // F#5 A5 B5 A5
+  659, 587, 659, 784     // E5 D5 E5 G5
+};
+const int musicLen = sizeof(musicNotes) / sizeof(musicNotes[0]);
+const int musicInterval = 120;    // ms between notes (tempo)
+const int musicNoteDur = 90;      // tone duration per step
+
+// ---------------- Button debounce ----------------
+bool lastReading = HIGH, stableState = HIGH;
+unsigned long lastChange = 0;
+const unsigned long debounceMs = 25;
+
+bool justPressed() {
+  bool r = digitalRead(BUTTON_PIN);
+  if (r != lastReading) { lastReading = r; lastChange = millis(); }
+  if (millis() - lastChange >= debounceMs) {
+    if (stableState != lastReading) {
+      stableState = lastReading;
+      if (stableState == LOW) return true;
+    }
+  }
+  return false;
+}
+
+// ---------------- Helpers ----------------
+bool rectOverlap(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) {
+  return (ax < bx + bw) && (ax + aw > bx) && (ay < by + bh) && (ay + ah > by);
+}
+
+void spawnCactus(int &x, int &h, int &type, int minOffset, int maxOffset) {
+  x = 128 + random(minOffset, maxOffset);
+  type = random(0, 2);                  // 0 or 1
+  h = (type == 0) ? random(14, 18) : random(18, 24);
+}
+
+// ---------------- SFX (short, non-blocking using tone duration) ----------------
+void sfxScore() {         // coin-like ding-ding
+  tone(BUZZER_PIN, 1568, 35);  // G6
+}
+
+void sfxJump() {          // jump blip
+  tone(BUZZER_PIN, 988, 30);   // B5
+}
+
+// Mario game over melody notes and durations (shortened)
+const int gameOverMelody[] = {
+  659, 622, 659, 523, 494, 392, 330, 392, 494
+};
+const int gameOverDurations[] = {
+  120, 120, 120, 120, 250, 120, 120, 120, 400
+};
+const int gameOverMelodyLen = 9;
+
+void sfxGameOver() {
+  // Play the full Mario game over melody
+  for (int i = 0; i < gameOverMelodyLen; i++) {
+    tone(BUZZER_PIN, gameOverMelody[i], gameOverDurations[i]);
+    delay(gameOverDurations[i] + 20);
+  }
+  noTone(BUZZER_PIN);
+}
+
+void resetGame() {
+  gameOver = false;
+  isJumping = false;
+  dinoY = groundY;
+  velocity = 0;
+
+  gameSpeed = 3;
+  score = 0;
+  lastSpeedIncrease = millis();
+  lastFrame = millis();
+  lastAnim = millis();
+  runFrame = 0;
+
+  spawnCactus(cactusX1, cactusH1, cactusType1, 0, 40);
+  spawnCactus(cactusX2, cactusH2, cactusType2, 50, 90);
+
+  passed1 = false;
+  passed2 = false;
+
+  dot1 = 20; dot2 = 70; dot3 = 110;
+
+  // reset music
+  lastMusicTime = millis();
+  musicStep = 0;
+  noTone(BUZZER_PIN);
+
+  display.clearDisplay();
+  display.display();
+}
+
+// ---------------- Drawing ----------------
+void drawCactus(int x, int h, int type) {
+  int baseY = 58;                  // ground line
+  int topY = baseY - h;
+
+  display.fillRect(x, topY, 6, h, SSD1306_WHITE);
+
+  if (type == 0) {
+    display.fillRect(x - 3, topY + 6, 3, 3, SSD1306_WHITE);
+    display.fillRect(x + 6, topY + 10, 3, 3, SSD1306_WHITE);
+  } else {
+    display.fillRect(x - 3, topY + 10, 3, 3, SSD1306_WHITE);
+    display.fillRect(x + 6, topY + 6, 3, 3, SSD1306_WHITE);
+  }
+}
+
+void drawDino(int x, int y, bool jumping, int frame) {
+  int bob = (!jumping) ? (frame ? 0 : 1) : 0;  // slight bob when running
+  int by = y + bob;
+
+  // body
+  display.fillRect(x, by, 10, 10, SSD1306_WHITE);
+
+  // head
+  display.fillRect(x + 8, by - 4, 6, 6, SSD1306_WHITE);
+  display.fillRect(x + 12, by - 2, 2, 2, SSD1306_BLACK);  // eye cutout
+
+  // tail
+  display.drawLine(x - 2, by + 4, x, by + 6, SSD1306_WHITE);
+
+  // legs
+  if (jumping) {
+    display.fillRect(x + 2, by + 10, 3, 2, SSD1306_WHITE);
+    display.fillRect(x + 6, by + 10, 3, 2, SSD1306_WHITE);
+  } else {
+    if (frame == 0) {
+      display.fillRect(x + 1, by + 10, 3, 4, SSD1306_WHITE);
+      display.fillRect(x + 6, by + 10, 3, 2, SSD1306_WHITE);
+    } else {
+      display.fillRect(x + 1, by + 10, 3, 2, SSD1306_WHITE);
+      display.fillRect(x + 6, by + 10, 3, 4, SSD1306_WHITE);
+    }
+  }
+}
+
+void setup() {
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) while (1);
+  display.clearDisplay();
+  display.display();
+
+  randomSeed(analogRead(A0));
+  resetGame();
+}
+
+void loop() {
+  unsigned long t = millis();
+  if (t - lastFrame < 50) return;    // ~20 FPS
+  lastFrame = t;
+
+  bool press = justPressed();
+
+  // ----- background music -----
+  if (!gameOver) {
+    if (t - lastMusicTime >= (unsigned long)musicInterval) {
+      tone(BUZZER_PIN, musicNotes[musicStep], musicNoteDur);
+      musicStep = (musicStep + 1) % musicLen;
+      lastMusicTime = t;
+    }
+  } else {
+    noTone(BUZZER_PIN);
+  }
+
+  if (gameOver) {
+    if (press) resetGame();
+    return;
+  }
+
+  // jump
+  if (press && dinoY == groundY) {
+    isJumping = true;
+    velocity = -15;
+    sfxJump();
+  }
+
+  // animation tick
+  if (t - lastAnim >= 120) {
+    runFrame ^= 1;
+    lastAnim = t;
+  }
+
+  // physics
+  if (isJumping) {
+    dinoY += velocity;
+    velocity += gravity;
+    if (dinoY >= groundY) {
+      dinoY = groundY;
+      isJumping = false;
+    }
+  }
+
+  // move obstacles
+  cactusX1 -= gameSpeed;
+  cactusX2 -= gameSpeed;
+
+  if (cactusX1 < -20) { spawnCactus(cactusX1, cactusH1, cactusType1, 0, 50); passed1 = false; }
+  if (cactusX2 < -20) { spawnCactus(cactusX2, cactusH2, cactusType2, 40, 90); passed2 = false; }
+
+  if (abs(cactusX1 - cactusX2) < 24) cactusX2 += 30;
+
+  // speed up slowly
+  if (t - lastSpeedIncrease >= 3000) {
+    if (gameSpeed < 8) gameSpeed++;
+    lastSpeedIncrease = t;
+  }
+
+  // score when you PASS a cactus
+  if (!passed1 && cactusX1 + 6 < dinoX) {
+    passed1 = true;
+    score++;
+    sfxScore();
+  }
+  if (!passed2 && cactusX2 + 6 < dinoX) {
+    passed2 = true;
+    score++;
+    sfxScore();
+  }
+
+  // parallax dots
+  dot1 -= gameSpeed; if (dot1 < 0) dot1 = 128 + random(0, 20);
+  dot2 -= gameSpeed; if (dot2 < 0) dot2 = 128 + random(20, 40);
+  dot3 -= gameSpeed; if (dot3 < 0) dot3 = 128 + random(40, 60);
+
+  // ----- collision -----
+  int dW = 14, dH = 16;
+  int dHitX = dinoX;
+  int dHitY = dinoY - 4;
+
+  int baseY = 58;
+  int c1W = 6, c2W = 6;
+  int c1X = cactusX1, c2X = cactusX2;
+  int c1Y = baseY - cactusH1, c2Y = baseY - cactusH2;
+
+  bool hit1 = rectOverlap(dHitX, dHitY, dW, dH, c1X, c1Y, c1W, cactusH1);
+  bool hit2 = rectOverlap(dHitX, dHitY, dW, dH, c2X, c2Y, c2W, cactusH2);
+
+  if (hit1 || hit2) {
+    gameOver = true;
+    sfxGameOver();
+  }
+
+  // ----- draw -----
+  display.clearDisplay();
+
+  display.drawLine(0, 58, 128, 58, SSD1306_WHITE);
+
+  display.drawPixel(dot1, 57, SSD1306_WHITE);
+  display.drawPixel(dot2, 57, SSD1306_WHITE);
+  display.drawPixel(dot3, 57, SSD1306_WHITE);
+
+  drawCactus(cactusX1, cactusH1, cactusType1);
+  drawCactus(cactusX2, cactusH2, cactusType2);
+
+  drawDino(dinoX, dinoY, isJumping, runFrame);
+
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print("Score:");
+  display.print(score);
+
+  display.setCursor(88, 0);
+  display.print("Sp:");
+  display.print(gameSpeed);
+
+  if (gameOver) {
+    display.setTextSize(2);
+    display.setCursor(18, 18);
+    display.print("Game");
+    display.setCursor(18, 36);
+    display.print("Over");
+    display.setTextSize(1);
+    display.setCursor(10, 56);
+    display.print("Press");
+  }
+
+  display.display();
+}
